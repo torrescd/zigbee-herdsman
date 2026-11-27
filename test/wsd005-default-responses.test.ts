@@ -133,4 +133,17 @@ describe("movement Default Responses", () => {
         send.mockResolvedValue(packet("08090b0201"));
         await expect(endpoint.command("closuresWindowCovering", "stop", {}, {transactionSequenceNumber: 9})).rejects.toThrow(/FAILURE/);
     });
+
+    it("matches an explicit source endpoint and includes unrecognized status bytes in diagnostics", async () => {
+        const options = {transactionSequenceNumber: 1, srcEndpoint: 2};
+        const ok = packet("08010b0500", {destinationEndpoint: 2});
+        send.mockImplementation(() => {
+            adapter.emit("zclPayload", packet("08010b0501", {destinationEndpoint: 1}));
+            adapter.emit("zclPayload", ok);
+            adapter.emit("zclPayload", packet("08010b0555", {destinationEndpoint: 2}));
+            return Promise.resolve(ok);
+        });
+        const result = endpoint.command("closuresWindowCovering", "goToLiftPercentage", {percentageliftvalue: 50}, options);
+        await expect(result).rejects.toThrow("conflicting Default Responses (SUCCESS, 85)");
+    });
 });
