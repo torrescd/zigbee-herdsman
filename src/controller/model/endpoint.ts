@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import type {Events as AdapterEvents} from "../../adapter";
 import {logger} from "../../utils/logger";
+import {wait} from "../../utils/wait";
 import * as ZSpec from "../../zspec";
 import {BroadcastAddress} from "../../zspec/enums";
 import type {Eui64} from "../../zspec/tstypes";
@@ -30,6 +31,8 @@ import Group from "./group";
 import {ZigbeeEntity} from "./zigbeeEntity";
 
 const NS = "zh:controller:endpoint";
+// The two replies in Zigbee2MQTT #33842 arrived 31 ms and 116 ms apart.
+const WSD005_REPLY_WINDOW_MS = 500;
 
 export interface ConfigureReportingItem<Cl extends string | number, Custom extends TCustomCluster | undefined = undefined> {
     attribute: ClusterOrRawAttributeKeys<Cl, Custom>[number] | {ID: number; type: number};
@@ -955,7 +958,52 @@ export class Endpoint extends ZigbeeEntity {
     ): Promise<undefined | KeyValue> {
         const frame = await this.zclCommand(clusterKey, commandKey, payload, options, undefined, false, Zcl.FrameType.SPECIFIC);
         if (frame) {
+            // Apply herdsman #1927 to Default Responses. Cluster-specific payloads have their own layouts.
+            if (!options?.disableResponse && frame.header.isGlobal && frame.command.ID === Zcl.Foundation.defaultRsp.ID) {
+                this.checkStatus(frame.payload);
+            }
             return frame.payload;
+        }
+    }
+
+    private async sendWsd005Movement(frame: Zcl.Frame, options: OptionsWithDefaults): Promise<AdapterEvents.ZclPayload> {
+        const adapter = Entity.adapter;
+        const replies = new Map<number, AdapterEvents.ZclPayload>();
+        const record = (response: AdapterEvents.ZclPayload): void => {
+            const {header, data} = response;
+            if (
+                (response.address === this.deviceNetworkAddress || response.address === this.deviceIeeeAddress) &&
+                response.endpoint === this.ID &&
+                (options.srcEndpoint === undefined || response.destinationEndpoint === options.srcEndpoint) &&
+                response.clusterID === frame.cluster.ID &&
+                !response.wasBroadcast &&
+                header?.isGlobal &&
+                !header.frameControl.manufacturerSpecific &&
+                header.frameControl.direction === Zcl.Direction.SERVER_TO_CLIENT &&
+                header.transactionSequenceNumber === frame.header.transactionSequenceNumber &&
+                header.commandIdentifier === Zcl.Foundation.defaultRsp.ID &&
+                data.length === header.length + 2 &&
+                data[header.length] === frame.command.ID
+            ) {
+                replies.set(data.readUInt8(header.length + 1), response);
+            }
+        };
+
+        // Listen before sending so two replies in the same serial batch cannot race listener registration.
+        adapter.on("zclPayload", record);
+        try {
+            const first = await this.sendRequest(frame, options);
+            if (first) record(first);
+            if (replies.size < 2) await wait(WSD005_REPLY_WINDOW_MS);
+            if (replies.size > 1) {
+                const statuses = [...replies.keys()].map((status) => Zcl.Status[status] ?? status).join(", ");
+                throw new Error(`WSD005 returned conflicting Default Responses (${statuses}). Physical movement is unknown.`);
+            }
+            const matched = replies.values().next().value;
+            if (!matched) throw new Error("No matching WSD005 movement Default Response");
+            return matched;
+        } finally {
+            adapter.off("zclPayload", record);
         }
     }
 
@@ -1171,7 +1219,19 @@ export class Endpoint extends ZigbeeEntity {
         logger.debug(createLogMessage, NS);
 
         try {
-            const result = await this.sendRequest(frame, optionsWithDefaults);
+            const collectMovementReplies =
+                device.modelID === "WSD005" &&
+                device.manufacturerName?.toLowerCase() === "adeo" &&
+                frame.header.isSpecific &&
+                frame.header.frameControl.direction === Zcl.Direction.CLIENT_TO_SERVER &&
+                !frame.header.frameControl.manufacturerSpecific &&
+                frame.isCluster("closuresWindowCovering") &&
+                ["upOpen", "downClose", "goToLiftPercentage"].includes(command.name) &&
+                !optionsWithDefaults.disableResponse &&
+                !optionsWithDefaults.disableDefaultResponse;
+            const result = collectMovementReplies
+                ? await this.sendWsd005Movement(frame, optionsWithDefaults)
+                : await this.sendRequest(frame, optionsWithDefaults);
 
             if (result) {
                 const resultFrame = Zcl.Frame.fromBuffer(result.clusterID, result.header, result.data, device.customClusters);
