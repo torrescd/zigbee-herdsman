@@ -1,0 +1,50 @@
+name: WSD005 test image
+on:
+  push:
+    branches: [codex/wsd005-default-responses]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    if: github.repository == 'torrescd/zigbee-herdsman'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install --global pnpm@10.33.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run check
+      - run: pnpm run build
+      - run: pnpm run test --testTimeout=10000 --maxWorkers=4
+      - name: Build and verify the Zigbee2MQTT runtime
+        run: |
+          image="ghcr.io/torrescd/zigbee2mqtt-wsd005:2.13.0-${GITHUB_SHA::12}"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          docker build -f test-image/Dockerfile --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "$image" dist/controller/model
+          expected=$(sha256sum dist/controller/model/endpoint.js | cut -d' ' -f1)
+          docker run --rm -e EXPECTED="$expected" --entrypoint node "$image" -e '
+            const assert = require("node:assert/strict");
+            const {createHash} = require("node:crypto");
+            const {readFileSync} = require("node:fs");
+            const {join, dirname} = require("node:path");
+            const lib = require.resolve("zigbee-herdsman");
+            const endpoint = join(dirname(lib), "controller/model/endpoint.js");
+            assert.equal(require("./package.json").version, "2.13.0");
+            assert.equal(require("zigbee-herdsman/package.json").version, "10.8.0");
+            assert.equal(createHash("sha256").update(readFileSync(endpoint)).digest("hex"), process.env.EXPECTED);
+            require(lib);
+          '
+      - name: Publish and check registry digest
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
+          docker buildx imagetools inspect "$IMAGE" | tee -a "$GITHUB_STEP_SUMMARY"
